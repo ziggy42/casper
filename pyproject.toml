@@ -1,0 +1,18 @@
+[project]
+name = "casper"
+version = "0.0.1"
+requires-python = ">=3.12"
+
+[tool.pylint.format]
+indent-string = '  '
+indent-after-paren = 2
+
+[tool.pylint.messages_control]
+disable = [
+  "C0114",  # missing-module-docstring
+  "C0115",  # missing-class-docstring
+  "C0116",  # missing-function-docstring
+]
+
+[tool.autopep8]
+indent-size = 2
