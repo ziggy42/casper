@@ -1,18 +1,4 @@
 #!/usr/bin/env python3
-"""Casper — a coding agent you can run without installing anything.
-
-  curl -fsSL https://raw.githubusercontent.com/ziggy42/casper/main/casper.py \\
-      | ANTHROPIC_API_KEY=sk-... python3
-
-Zero dependencies, single file, Linux and macOS only. The provider is picked
-from whichever API key is set: ANTHROPIC_API_KEY, OPENAI_API_KEY, or
-GEMINI_API_KEY / GOOGLE_API_KEY. Override the default model with CASPER_MODEL.
-
-Casper is not sandboxed: it runs the shell commands and file edits the model
-asks for, with your full user permissions and without asking. Run it only in
-directories whose contents you trust.
-"""
-
 import itertools
 import json
 import os
@@ -25,7 +11,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, ClassVar, TypedDict
 
 type Json = dict[str, Any]
 
@@ -56,23 +42,35 @@ def style(code: int, s: str) -> str:
   return f"\x1b[{code}m{s}\x1b[0m"
 
 
-def bold(s: str) -> str: return style(1, s)
-def dim(s: str) -> str: return style(2, s)
-def red(s: str) -> str: return style(31, s)
-def green(s: str) -> str: return style(32, s)
+def bold(s: str) -> str:
+  return style(1, s)
+
+
+def dim(s: str) -> str:
+  return style(2, s)
+
+
+def red(s: str) -> str:
+  return style(31, s)
+
+
+def green(s: str) -> str:
+  return style(32, s)
 
 
 def plural(n: int, noun: str) -> str:
   return f"{n} {noun}" + ("" if n == 1 else "s")
 
 
-_midline = False
-_spinner: tuple[threading.Event, threading.Thread] | None = None
+class _Term:  # pylint: disable=too-few-public-methods
+  """Mutable display state; the module is in effect one terminal object."""
+  midline: ClassVar[bool] = False
+  spinner_stop: ClassVar[threading.Event | None] = None
+  spinner_thread: ClassVar[threading.Thread | None] = None
 
 
 def spin() -> None:
   """Show a waiting animation until the next output through emit/newline."""
-  global _spinner  # pylint: disable=global-statement
   stop = threading.Event()
 
   def loop() -> None:
@@ -84,37 +82,34 @@ def spin() -> None:
 
   thread = threading.Thread(target=loop, daemon=True)
   thread.start()
-  _spinner = (stop, thread)
+  _Term.spinner_stop, _Term.spinner_thread = stop, thread
 
 
 def unspin() -> None:
-  global _spinner  # pylint: disable=global-statement
-  if _spinner:
-    stop, thread = _spinner
-    _spinner = None
-    stop.set()
-    thread.join()  # wait for the line to be erased before printing over it
+  if _Term.spinner_stop and _Term.spinner_thread:
+    _Term.spinner_stop.set()
+    # Wait for the line to be erased before anyone prints over it.
+    _Term.spinner_thread.join()
+    _Term.spinner_stop = _Term.spinner_thread = None
 
 
 def emit(chunk: str) -> None:
   """Print a streamed piece of text, remembering if the line is unfinished."""
-  global _midline  # pylint: disable=global-statement
   unspin()
   print(chunk, end="", flush=True)
-  _midline = not chunk.endswith("\n")
+  _Term.midline = not chunk.endswith("\n")
 
 
 def newline() -> None:
   """Terminate the streamed line, if one is open."""
-  global _midline  # pylint: disable=global-statement
   unspin()
-  if _midline:
+  if _Term.midline:
     print()
-  _midline = False
+  _Term.midline = False
 
 
 # ── Tools ────────────────────────────────────────────────────────────────
-# The schema and the implementation live together: a tool's "required"
+# The schema and the implementations live together: a tool's "required"
 # parameters must stay in step with what execute_tool destructures. The
 # schema is OpenAI-style JSON Schema, which the Anthropic and Gemini APIs
 # accept as-is for tool parameters.
@@ -180,10 +175,74 @@ TOOLS: list[Json] = [
     },
 ]
 
+# What every tool returns: (output for the model, display body, failed).
+type ToolResult = tuple[str, str, bool]
 
-def resolve_path(path: str) -> Path:
-  """Expand ~ — models regularly produce home-relative paths."""
-  return Path(path).expanduser()
+
+def bash(command: str) -> ToolResult:
+  # stderr folds into stdout so the streams interleave in real order,
+  # as the tool description promises the model.
+  r = subprocess.run(command, shell=True, check=False, timeout=300,
+                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                     encoding="utf-8", errors="replace")
+  out = r.stdout.strip()
+  if r.returncode == 0:
+    return out, out, False
+  body = (out + "\n" if out else "") + red(f"exit {r.returncode}")
+  return out + f"\n(exit code {r.returncode})", body, True
+
+
+def read_file(path: str) -> ToolResult:
+  content = Path(path).expanduser().read_text(encoding="utf-8")
+  read = plural(len(content.splitlines()), "line")
+  return content, dim(f"Read {read}"), False
+
+
+def edit_file(path: str, old_text: str, new_text: str) -> ToolResult:
+  target = Path(path).expanduser()
+  content = target.read_text(encoding="utf-8")
+  count = content.count(old_text)
+  if count == 0:
+    raise ValueError(f"text not found in {path}; "
+                     "it must match exactly, including whitespace")
+  if count > 1:
+    raise ValueError(f"found {count} occurrences of the text in {path}; "
+                     "the text must be unique — provide more context")
+  target.write_text(content.replace(old_text, new_text), encoding="utf-8")
+  body = dim(f"Replaced {plural(len(old_text.splitlines()), 'line')} "
+             f"with {plural(len(new_text.splitlines()), 'line')}")
+  return "ok", body, False
+
+
+def write_file(path: str, content: str) -> ToolResult:
+  target = Path(path).expanduser()
+  target.parent.mkdir(parents=True, exist_ok=True)
+  target.write_text(content, encoding="utf-8")
+  wrote = plural(len(content.splitlines()), "line")
+  return "ok", dim(f"Wrote {wrote}"), False
+
+
+def execute_tool(name: str, args: Json) -> ToolResult:
+  """Dispatch one tool call to its implementation, converting failures."""
+  try:
+    # Dict patterns match on "at least these keys", so extra fields a model
+    # invents are tolerated; missing required ones fall through to the error.
+    match name, args:
+      case "bash", {"command": command}:
+        return bash(command)
+      case "read_file", {"path": path}:
+        return read_file(path)
+      case "edit_file", {"path": path,
+                         "old_text": old_text, "new_text": new_text}:
+        return edit_file(path, old_text, new_text)
+      case "write_file", {"path": path, "content": content}:
+        return write_file(path, content)
+      case _:
+        out = f"unknown tool or missing arguments: {name}"
+        return out, red(out), True
+  except Exception as e:  # pylint: disable=broad-exception-caught
+    # Any tool failure is fed back to the model as text so it can adapt.
+    return f"error: {e}", red(f"error: {e}"), True
 
 
 def tool_title(name: str, args: Json) -> str:
@@ -192,57 +251,6 @@ def tool_title(name: str, args: Json) -> str:
   if len(summary) > 60:
     summary = summary[:59] + "…"
   return name + (f"({summary})" if summary else "")
-
-
-def execute_tool(name: str, args: Json) -> tuple[str, str, bool]:
-  """Run one tool; returns (output for the model, display body, failed)."""
-  try:
-    # Dict patterns match on "at least these keys", so extra fields a model
-    # invents are tolerated; missing required ones fall through to the error.
-    match name, args:
-      case "bash", {"command": command}:
-        # stderr folds into stdout so the streams interleave in real order,
-        # as the tool description promises the model.
-        r = subprocess.run(command, shell=True, check=False, timeout=300,
-                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           encoding="utf-8", errors="replace")
-        out = r.stdout.strip()
-        if r.returncode == 0:
-          return out, out, False
-        body = (out + "\n" if out else "") + red(f"exit {r.returncode}")
-        return out + f"\n(exit code {r.returncode})", body, True
-      case "read_file", {"path": path}:
-        content = resolve_path(path).read_text(encoding="utf-8")
-        read = plural(len(content.splitlines()), "line")
-        return content, dim(f"Read {read}"), False
-      case "edit_file", {"path": path,
-                         "old_text": old_text, "new_text": new_text}:
-        target = resolve_path(path)
-        content = target.read_text(encoding="utf-8")
-        count = content.count(old_text)
-        if count == 0:
-          raise ValueError(f"text not found in {path}; "
-                           "it must match exactly, including whitespace")
-        if count > 1:
-          raise ValueError(f"found {count} occurrences of the text in {path}; "
-                           "the text must be unique — provide more context")
-        target.write_text(content.replace(old_text, new_text),
-                          encoding="utf-8")
-        body = dim(f"Replaced {plural(len(old_text.splitlines()), 'line')} "
-                   f"with {plural(len(new_text.splitlines()), 'line')}")
-        return "ok", body, False
-      case "write_file", {"path": path, "content": content}:
-        target = resolve_path(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
-        wrote = plural(len(content.splitlines()), "line")
-        return "ok", dim(f"Wrote {wrote}"), False
-      case _:
-        out = f"unknown tool or missing arguments: {name}"
-        return out, red(out), True
-  except Exception as e:  # pylint: disable=broad-exception-caught
-    # Any tool failure is fed back to the model as text so it can adapt.
-    return f"error: {e}", red(f"error: {e}"), True
 
 
 # How much of a tool's output is shown: at most MAX_RESULT_LINES lines (the
@@ -319,7 +327,8 @@ class Provider:
   def send_user(self, text: str) -> list[ToolCall]:
     raise NotImplementedError
 
-  def send_results(self, results: list[tuple[ToolCall, str]]) -> list[ToolCall]:
+  def send_results(self,
+                   results: list[tuple[ToolCall, str]]) -> list[ToolCall]:
     raise NotImplementedError
 
 
@@ -330,7 +339,8 @@ class Anthropic(Provider):
     self.messages.append({"role": "user", "content": text})
     return self._request()
 
-  def send_results(self, results: list[tuple[ToolCall, str]]) -> list[ToolCall]:
+  def send_results(self,
+                   results: list[tuple[ToolCall, str]]) -> list[ToolCall]:
     self.messages.append({
         "role": "user",
         "content": [
@@ -396,7 +406,8 @@ class OpenAI(Provider):
     self.messages.append({"role": "user", "content": text})
     return self._request()
 
-  def send_results(self, results: list[tuple[ToolCall, str]]) -> list[ToolCall]:
+  def send_results(self,
+                   results: list[tuple[ToolCall, str]]) -> list[ToolCall]:
     for call, out in results:
       self.messages.append(
           {"role": "tool", "tool_call_id": call["id"], "content": out})
@@ -410,7 +421,8 @@ class OpenAI(Provider):
         {
             "model": self.model,
             "stream": True,
-            "messages": [{"role": "system", "content": SYSTEM}, *self.messages],
+            "messages": [{"role": "system", "content": SYSTEM},
+                         *self.messages],
             "tools": [{"type": "function", "function": t} for t in TOOLS],
         },
     )
@@ -453,7 +465,8 @@ class Google(Provider):
     self.messages.append({"role": "user", "parts": [{"text": text}]})
     return self._request()
 
-  def send_results(self, results: list[tuple[ToolCall, str]]) -> list[ToolCall]:
+  def send_results(self,
+                   results: list[tuple[ToolCall, str]]) -> list[ToolCall]:
     self.messages.append({
         "role": "user",
         "parts": [
@@ -467,8 +480,8 @@ class Google(Provider):
   def _request(self) -> list[ToolCall]:
     spin()
     events = sse_post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}"
-        ":streamGenerateContent?alt=sse",
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{self.model}:streamGenerateContent?alt=sse",
         {"x-goog-api-key": self.key},
         {
             "system_instruction": {"parts": [{"text": SYSTEM}]},
@@ -498,7 +511,8 @@ class Google(Provider):
           parts.append(part)
     newline()
     self.messages.append({"role": "model", "parts": parts})
-    return [{"id": p["functionCall"]["name"], "name": p["functionCall"]["name"],
+    return [{"id": p["functionCall"]["name"],
+             "name": p["functionCall"]["name"],
              "args": p["functionCall"].get("args", {})}
             for p in parts if "functionCall" in p]
 
@@ -506,15 +520,19 @@ class Google(Provider):
 # ── Entry ────────────────────────────────────────────────────────────────
 
 def pick_provider() -> Provider:
+  """Build the provider for whichever API key is set, CASPER_MODEL applied."""
+  provider: Provider
   if os.environ.get("ANTHROPIC_API_KEY"):
-    return Anthropic(os.environ["ANTHROPIC_API_KEY"])
-  if os.environ.get("OPENAI_API_KEY"):
-    return OpenAI(os.environ["OPENAI_API_KEY"])
-  if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
-    key = os.environ.get("GEMINI_API_KEY") or os.environ["GOOGLE_API_KEY"]
-    return Google(key)
-  sys.exit("casper: set ANTHROPIC_API_KEY, OPENAI_API_KEY, "
-           "or GEMINI_API_KEY / GOOGLE_API_KEY")
+    provider = Anthropic(os.environ["ANTHROPIC_API_KEY"])
+  elif os.environ.get("OPENAI_API_KEY"):
+    provider = OpenAI(os.environ["OPENAI_API_KEY"])
+  elif os.environ.get("GEMINI_API_KEY"):
+    provider = Google(os.environ["GEMINI_API_KEY"])
+  else:
+    sys.exit("casper: set ANTHROPIC_API_KEY, OPENAI_API_KEY, "
+             "or GEMINI_API_KEY")
+  provider.model = os.environ.get("CASPER_MODEL", provider.model)
+  return provider
 
 
 def main() -> None:
@@ -532,7 +550,6 @@ def main() -> None:
     pass
 
   provider = pick_provider()
-  provider.model = os.environ.get("CASPER_MODEL", provider.model)
   hints = dim(f"{provider.model} · /clear to reset · ctrl-d to exit")
   banner = f"👻 {bold('casper')}  {hints}"
   print(banner)

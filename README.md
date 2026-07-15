@@ -25,11 +25,11 @@ Requires Python 3.12+. Linux and macOS only — Windows is not supported.
 Casper runs on whatever you have. It selects the provider from whichever API
 key is set, and each provider has a sensible default model:
 
-| Environment variable            | Provider  | Default model          |
-| ------------------------------- | --------- | ---------------------- |
-| `ANTHROPIC_API_KEY`             | Anthropic | `claude-opus-4-8`      |
-| `OPENAI_API_KEY`                | OpenAI    | `gpt-5.6`              |
-| `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Google | `gemini-3-flash-preview` |
+| Environment variable | Provider  | Default model            |
+| -------------------- | --------- | ------------------------ |
+| `ANTHROPIC_API_KEY`  | Anthropic | `claude-opus-4-8`        |
+| `OPENAI_API_KEY`     | OpenAI    | `gpt-5.6`                |
+| `GEMINI_API_KEY`     | Google    | `gemini-3-flash-preview` |
 
 Defaults are pinned model IDs, not moving aliases like `gemini-flash-latest`,
 so casper's behavior doesn't change underneath you — and because the newest
