@@ -9,6 +9,7 @@ strict = true
 [tool.pylint.format]
 indent-string = '  '
 indent-after-paren = 2
+max-line-length = 80
 
 [tool.pylint.messages_control]
 disable = [

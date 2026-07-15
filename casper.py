@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Casper — a coding agent you can run without installing anything.
 
-    curl -fsSL https://raw.githubusercontent.com/ziggy42/casper/main/casper.py \\
-        | ANTHROPIC_API_KEY=sk-... python3
+  curl -fsSL https://raw.githubusercontent.com/ziggy42/casper/main/casper.py \\
+      | ANTHROPIC_API_KEY=sk-... python3
 
 Zero dependencies, single file, Linux and macOS only. The provider is picked
 from whichever API key is set: ANTHROPIC_API_KEY, OPENAI_API_KEY, or
 GEMINI_API_KEY / GOOGLE_API_KEY. Override the default model with CASPER_MODEL.
+
+Casper is not sandboxed: it runs the shell commands and file edits the model
+asks for, with your full user permissions and without asking. Run it only in
+directories whose contents you trust.
 """
 
 import itertools
@@ -16,6 +20,7 @@ import platform
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
@@ -32,7 +37,8 @@ class ToolCall(TypedDict):
   args: Json
 
 
-SYSTEM = f"""You are Casper, a coding agent running in a shell on the user's machine.
+SYSTEM = f"""\
+You are Casper, a coding agent running in a shell on the user's machine.
 Working directory: {os.getcwd()}
 Platform: {platform.system()} {platform.machine()}
 
@@ -41,54 +47,10 @@ to existing files (read the file first); write_file is for new files or full
 rewrites. Do the work, then briefly report what you did. Prefer acting over
 asking."""
 
-# One schema shared by all providers (OpenAI-style JSON Schema, which the
-# Anthropic and Gemini APIs accept as-is for tool parameters).
-TOOLS: list[Json] = [
-    {
-        "name": "bash",
-        "description": "Run a shell command and return its combined stdout and stderr.",
-        "parameters": {
-            "type": "object",
-            "properties": {"command": {"type": "string", "description": "The command to run."}},
-            "required": ["command"],
-        },
-    },
-    {
-        "name": "read_file",
-        "description": "Read a text file and return its contents.",
-        "parameters": {
-            "type": "object",
-            "properties": {"path": {"type": "string", "description": "Path of the file to read."}},
-            "required": ["path"],
-        },
-    },
-    {
-        "name": "edit_file",
-        "description": "Replace text in a file. old_text must match exactly (including whitespace) and be unique in the file.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Path of the file to edit."},
-                "old_text": {"type": "string", "description": "Exact text to replace; must appear exactly once in the file."},
-                "new_text": {"type": "string", "description": "The text to replace it with."},
-            },
-            "required": ["path", "old_text", "new_text"],
-        },
-    },
-    {
-        "name": "write_file",
-        "description": "Write content to a file, creating it (and parent directories) if needed.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Path of the file to write."},
-                "content": {"type": "string", "description": "Full content of the file."},
-            },
-            "required": ["path", "content"],
-        },
-    },
-]
 
+# ── Terminal output ──────────────────────────────────────────────────────
+# Everything casper prints flows through emit/newline, so streamed text, the
+# tool trace, and the waiting spinner never trample each other's lines.
 
 def style(code: int, s: str) -> str:
   return f"\x1b[{code}m{s}\x1b[0m"
@@ -112,17 +74,17 @@ def spin() -> None:
   """Show a waiting animation until the next output through emit/newline."""
   global _spinner  # pylint: disable=global-statement
   stop = threading.Event()
-  thread = threading.Thread(target=_spin_loop, args=(stop,), daemon=True)
+
+  def loop() -> None:
+    for frame in itertools.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"):
+      print("\r" + dim(f"{frame} thinking…"), end="", flush=True)
+      if stop.wait(0.1):
+        break
+    print("\r\x1b[K", end="", flush=True)  # erase the spinner line
+
+  thread = threading.Thread(target=loop, daemon=True)
   thread.start()
   _spinner = (stop, thread)
-
-
-def _spin_loop(stop: threading.Event) -> None:
-  for frame in itertools.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"):
-    print("\r" + dim(f"{frame} thinking…"), end="", flush=True)
-    if stop.wait(0.1):
-      break
-  print("\r\x1b[K", end="", flush=True)  # erase the spinner line
 
 
 def unspin() -> None:
@@ -151,6 +113,79 @@ def newline() -> None:
   _midline = False
 
 
+# ── Tools ────────────────────────────────────────────────────────────────
+# The schema and the implementation live together: a tool's "required"
+# parameters must stay in step with what execute_tool destructures. The
+# schema is OpenAI-style JSON Schema, which the Anthropic and Gemini APIs
+# accept as-is for tool parameters.
+
+TOOLS: list[Json] = [
+    {
+        "name": "bash",
+        "description": "Run a shell command and return its combined stdout "
+                       "and stderr.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string",
+                            "description": "The command to run."},
+            },
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "read_file",
+        "description": "Read a text file and return its contents.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string",
+                         "description": "Path of the file to read."},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "edit_file",
+        "description": "Replace text in a file. old_text must match exactly "
+                       "(including whitespace) and be unique in the file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string",
+                         "description": "Path of the file to edit."},
+                "old_text": {"type": "string",
+                             "description": "Exact text to replace; must "
+                                            "appear exactly once in the file."},
+                "new_text": {"type": "string",
+                             "description": "The text to replace it with."},
+            },
+            "required": ["path", "old_text", "new_text"],
+        },
+    },
+    {
+        "name": "write_file",
+        "description": "Write content to a file, creating it (and parent "
+                       "directories) if needed.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string",
+                         "description": "Path of the file to write."},
+                "content": {"type": "string",
+                            "description": "Full content of the file."},
+            },
+            "required": ["path", "content"],
+        },
+    },
+]
+
+
+def resolve_path(path: str) -> Path:
+  """Expand ~ — models regularly produce home-relative paths."""
+  return Path(path).expanduser()
+
+
 def tool_title(name: str, args: Json) -> str:
   """Render a call as "name(one-line summary)", capped so it can't wrap."""
   summary = " ".join(str(args.get("command") or args.get("path") or "").split())
@@ -159,8 +194,62 @@ def tool_title(name: str, args: Json) -> str:
   return name + (f"({summary})" if summary else "")
 
 
-# How many lines of a tool's output are shown; the rest collapse into a count.
+def execute_tool(name: str, args: Json) -> tuple[str, str, bool]:
+  """Run one tool; returns (output for the model, display body, failed)."""
+  try:
+    # Dict patterns match on "at least these keys", so extra fields a model
+    # invents are tolerated; missing required ones fall through to the error.
+    match name, args:
+      case "bash", {"command": command}:
+        # stderr folds into stdout so the streams interleave in real order,
+        # as the tool description promises the model.
+        r = subprocess.run(command, shell=True, check=False, timeout=300,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           encoding="utf-8", errors="replace")
+        out = r.stdout.strip()
+        if r.returncode == 0:
+          return out, out, False
+        body = (out + "\n" if out else "") + red(f"exit {r.returncode}")
+        return out + f"\n(exit code {r.returncode})", body, True
+      case "read_file", {"path": path}:
+        content = resolve_path(path).read_text(encoding="utf-8")
+        read = plural(len(content.splitlines()), "line")
+        return content, dim(f"Read {read}"), False
+      case "edit_file", {"path": path,
+                         "old_text": old_text, "new_text": new_text}:
+        target = resolve_path(path)
+        content = target.read_text(encoding="utf-8")
+        count = content.count(old_text)
+        if count == 0:
+          raise ValueError(f"text not found in {path}; "
+                           "it must match exactly, including whitespace")
+        if count > 1:
+          raise ValueError(f"found {count} occurrences of the text in {path}; "
+                           "the text must be unique — provide more context")
+        target.write_text(content.replace(old_text, new_text),
+                          encoding="utf-8")
+        body = dim(f"Replaced {plural(len(old_text.splitlines()), 'line')} "
+                   f"with {plural(len(new_text.splitlines()), 'line')}")
+        return "ok", body, False
+      case "write_file", {"path": path, "content": content}:
+        target = resolve_path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        wrote = plural(len(content.splitlines()), "line")
+        return "ok", dim(f"Wrote {wrote}"), False
+      case _:
+        out = f"unknown tool or missing arguments: {name}"
+        return out, red(out), True
+  except Exception as e:  # pylint: disable=broad-exception-caught
+    # Any tool failure is fed back to the model as text so it can adapt.
+    return f"error: {e}", red(f"error: {e}"), True
+
+
+# How much of a tool's output is shown: at most MAX_RESULT_LINES lines (the
+# rest collapse into a count), each capped at MAX_RESULT_COLS characters so a
+# single giant line (minified JS, base64) can't flood the terminal.
 MAX_RESULT_LINES = 10
+MAX_RESULT_COLS = 200
 
 
 def run_tool(name: str, args: Json) -> str:
@@ -175,6 +264,10 @@ def run_tool(name: str, args: Json) -> str:
   if len(lines) > MAX_RESULT_LINES:
     hidden = len(lines) - MAX_RESULT_LINES
     lines = lines[:MAX_RESULT_LINES] + [dim(f"… +{plural(hidden, 'line')}")]
+  # The reset guards against the cut landing inside an ANSI color sequence.
+  lines = [line if len(line) <= MAX_RESULT_COLS
+           else line[:MAX_RESULT_COLS] + "\x1b[0m" + dim("…")
+           for line in lines]
   for i, line in enumerate(lines):
     emit(("   " + dim("⎿") + "  " if i == 0 else "      ") + line + "\n")
   if len(out) > 50_000:
@@ -182,72 +275,39 @@ def run_tool(name: str, args: Json) -> str:
   return out or "(no output)"
 
 
-def execute_tool(name: str, args: Json) -> tuple[str, str, bool]:
-  """Run one tool; returns (output for the model, display body, failed)."""
-  try:
-    # Dict patterns match on "at least these keys", so extra fields a model
-    # invents are tolerated; missing required ones fall through to the error.
-    match name, args:
-      case "bash", {"command": command}:
-        r = subprocess.run(command, shell=True, check=False,
-                           capture_output=True, text=True, timeout=300)
-        out = (r.stdout + r.stderr).strip()
-        if r.returncode == 0:
-          return out, out, False
-        body = (out + "\n" if out else "") + red(f"exit {r.returncode}")
-        return out + f"\n(exit code {r.returncode})", body, True
-      case "read_file", {"path": path}:
-        content = Path(path).read_text(encoding="utf-8")
-        return content, dim(f"Read {plural(len(content.splitlines()), 'line')}"), False
-      case "edit_file", {"path": path, "old_text": old_text, "new_text": new_text}:
-        content = Path(path).read_text(encoding="utf-8")
-        count = content.count(old_text)
-        if count == 0:
-          raise ValueError(f"text not found in {path}; "
-                           "it must match exactly, including whitespace")
-        if count > 1:
-          raise ValueError(f"found {count} occurrences of the text in {path}; "
-                           "the text must be unique — provide more context")
-        Path(path).write_text(content.replace(old_text, new_text), encoding="utf-8")
-        return "ok", dim(f"Replaced {plural(len(old_text.splitlines()), 'line')} "
-                         f"with {plural(len(new_text.splitlines()), 'line')}"), False
-      case "write_file", {"path": path, "content": content}:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_text(content, encoding="utf-8")
-        return "ok", dim(f"Wrote {plural(len(content.splitlines()), 'line')}"), False
-      case _:
-        out = f"unknown tool or missing arguments: {name}"
-        return out, red(out), True
-  except Exception as e:  # pylint: disable=broad-exception-caught
-    # Any tool failure is fed back to the model as text so it can adapt.
-    return f"error: {e}", red(f"error: {e}"), True
-
-
-def sse_post(url: str, headers: dict[str, str], body: Json) -> Iterator[Json]:
-  """POST `body` and yield each JSON payload of the SSE response as it arrives."""
-  req = urllib.request.Request(
-      url, data=json.dumps(body).encode(),
-      headers={"content-type": "application/json"} | headers)
-  try:
-    # The timeout is per socket read, so it bounds the silence before the
-    # next chunk, not the total duration of the response.
-    with urllib.request.urlopen(req, timeout=300) as r:
-      for line in r:
-        data = line.decode().strip()
-        if data.startswith("data:"):
-          data = data.removeprefix("data:").strip()
-          if data == "[DONE]":
-            return
-          yield json.loads(data)
-  except urllib.error.HTTPError as e:
-    raise RuntimeError(f"API error {e.code}: {e.read().decode()}") from None
-  except OSError as e:
-    raise RuntimeError(f"network error: {e}") from None
-
-
+# ── Providers ────────────────────────────────────────────────────────────
 # Each provider keeps the conversation in its own wire format in
 # self.messages, prints response text as it streams in, and returns the list
 # of tool calls to run, each normalized to a ToolCall.
+
+def sse_post(url: str, headers: dict[str, str], body: Json) -> Iterator[Json]:
+  """POST `body`; yield each JSON payload of the SSE reply as it arrives."""
+  req = urllib.request.Request(
+      url, data=json.dumps(body).encode(),
+      headers={"content-type": "application/json"} | headers)
+  for attempt in (1, 2, 3):
+    try:
+      # The timeout is per socket read, so it bounds the silence before the
+      # next chunk, not the total duration of the response.
+      with urllib.request.urlopen(req, timeout=300) as r:
+        for line in r:
+          data = line.decode().strip()
+          if data.startswith("data:"):
+            data = data.removeprefix("data:").strip()
+            if data == "[DONE]":
+              return
+            yield json.loads(data)
+      return
+    except urllib.error.HTTPError as e:
+      # Overload and rate-limit errors are transient more often than not;
+      # they arrive before any output, so retrying is always safe here.
+      if e.code in (429, 500, 502, 503, 529) and attempt < 3:
+        time.sleep(attempt)
+        continue
+      raise RuntimeError(f"API error {e.code}: {e.read().decode()}") from None
+    except OSError as e:
+      raise RuntimeError(f"network error: {e}") from None
+
 
 class Provider:
   model: str
@@ -330,7 +390,7 @@ class Anthropic(Provider):
 
 
 class OpenAI(Provider):
-  model = "gpt-5.1"
+  model = "gpt-5.6"
 
   def send_user(self, text: str) -> list[ToolCall]:
     self.messages.append({"role": "user", "content": text})
@@ -385,7 +445,9 @@ class OpenAI(Provider):
 
 
 class Google(Provider):
-  model = "gemini-flash-latest"
+  # Pinned on purpose: the "gemini-flash-latest" alias tracks the newest
+  # Flash model, which tends to be the most overloaded one (503s, queues).
+  model = "gemini-3-flash-preview"
 
   def send_user(self, text: str) -> list[ToolCall]:
     self.messages.append({"role": "user", "parts": [{"text": text}]})
@@ -441,15 +503,18 @@ class Google(Provider):
             for p in parts if "functionCall" in p]
 
 
+# ── Entry ────────────────────────────────────────────────────────────────
+
 def pick_provider() -> Provider:
   if os.environ.get("ANTHROPIC_API_KEY"):
     return Anthropic(os.environ["ANTHROPIC_API_KEY"])
   if os.environ.get("OPENAI_API_KEY"):
     return OpenAI(os.environ["OPENAI_API_KEY"])
   if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
-    return Google(os.environ.get("GEMINI_API_KEY") or os.environ["GOOGLE_API_KEY"])
-  sys.exit(
-      "casper: set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY / GOOGLE_API_KEY")
+    key = os.environ.get("GEMINI_API_KEY") or os.environ["GOOGLE_API_KEY"]
+    return Google(key)
+  sys.exit("casper: set ANTHROPIC_API_KEY, OPENAI_API_KEY, "
+           "or GEMINI_API_KEY / GOOGLE_API_KEY")
 
 
 def main() -> None:
@@ -468,7 +533,8 @@ def main() -> None:
 
   provider = pick_provider()
   provider.model = os.environ.get("CASPER_MODEL", provider.model)
-  banner = f"👻 {bold('casper')}  {dim(f'{provider.model} · /clear to reset · ctrl-d to exit')}"
+  hints = dim(f"{provider.model} · /clear to reset · ctrl-d to exit")
+  banner = f"👻 {bold('casper')}  {hints}"
   print(banner)
 
   while True:
@@ -501,10 +567,14 @@ def main() -> None:
       del provider.messages[checkpoint:]
       newline()
       print("casper: interrupted")
-    except RuntimeError as e:
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      # RuntimeError carries API/network errors; anything else is a provider
+      # sending events we don't expect. Neither may kill the REPL, and the
+      # rollback above keeps the history consistent either way.
       del provider.messages[checkpoint:]
       newline()
-      print(f"casper: {e}")
+      detail = str(e) if isinstance(e, RuntimeError) else f"unexpected: {e!r}"
+      print(f"casper: {detail}")
 
 
 if __name__ == "__main__":
