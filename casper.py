@@ -18,7 +18,19 @@ import sys
 import threading
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any, TypedDict
+
+type Json = dict[str, Any]
+
+
+class ToolCall(TypedDict):
+  """A tool invocation normalized across providers."""
+  id: str
+  name: str
+  args: Json
+
 
 SYSTEM = f"""You are Casper, a coding agent running in a shell on the user's machine.
 Working directory: {os.getcwd()}
@@ -31,7 +43,7 @@ asking."""
 
 # One schema shared by all providers (OpenAI-style JSON Schema, which the
 # Anthropic and Gemini APIs accept as-is for tool parameters).
-TOOLS = [
+TOOLS: list[Json] = [
     {
         "name": "bash",
         "description": "Run a shell command and return its combined stdout and stderr.",
@@ -78,25 +90,25 @@ TOOLS = [
 ]
 
 
-def style(code, s):
+def style(code: int, s: str) -> str:
   return f"\x1b[{code}m{s}\x1b[0m"
 
 
-def bold(s): return style(1, s)
-def dim(s): return style(2, s)
-def red(s): return style(31, s)
-def green(s): return style(32, s)
+def bold(s: str) -> str: return style(1, s)
+def dim(s: str) -> str: return style(2, s)
+def red(s: str) -> str: return style(31, s)
+def green(s: str) -> str: return style(32, s)
 
 
-def plural(n, noun):
+def plural(n: int, noun: str) -> str:
   return f"{n} {noun}" + ("" if n == 1 else "s")
 
 
 _midline = False
-_spinner = None  # (stop event, thread) while the waiting animation runs
+_spinner: tuple[threading.Event, threading.Thread] | None = None
 
 
-def spin():
+def spin() -> None:
   """Show a waiting animation until the next output through emit/newline."""
   global _spinner  # pylint: disable=global-statement
   stop = threading.Event()
@@ -105,7 +117,7 @@ def spin():
   _spinner = (stop, thread)
 
 
-def _spin_loop(stop):
+def _spin_loop(stop: threading.Event) -> None:
   for frame in itertools.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"):
     print("\r" + dim(f"{frame} thinking…"), end="", flush=True)
     if stop.wait(0.1):
@@ -113,7 +125,7 @@ def _spin_loop(stop):
   print("\r\x1b[K", end="", flush=True)  # erase the spinner line
 
 
-def unspin():
+def unspin() -> None:
   global _spinner  # pylint: disable=global-statement
   if _spinner:
     stop, thread = _spinner
@@ -122,7 +134,7 @@ def unspin():
     thread.join()  # wait for the line to be erased before printing over it
 
 
-def emit(chunk):
+def emit(chunk: str) -> None:
   """Print a streamed piece of text, remembering if the line is unfinished."""
   global _midline  # pylint: disable=global-statement
   unspin()
@@ -130,7 +142,7 @@ def emit(chunk):
   _midline = not chunk.endswith("\n")
 
 
-def newline():
+def newline() -> None:
   """Terminate the streamed line, if one is open."""
   global _midline  # pylint: disable=global-statement
   unspin()
@@ -139,8 +151,8 @@ def newline():
   _midline = False
 
 
-def tool_title(name, args):
-  """Render a call as "Name(one-line summary)", capped so it can't wrap."""
+def tool_title(name: str, args: Json) -> str:
+  """Render a call as "name(one-line summary)", capped so it can't wrap."""
   summary = " ".join(str(args.get("command") or args.get("path") or "").split())
   if len(summary) > 60:
     summary = summary[:59] + "…"
@@ -151,7 +163,7 @@ def tool_title(name, args):
 MAX_RESULT_LINES = 10
 
 
-def run_tool(name, args):
+def run_tool(name: str, args: Json) -> str:
   """Execute one tool call, tracing it to the terminal: a pending line while
   the tool runs, rewritten with a green/red dot once it finishes, then the
   result body indented beneath it."""
@@ -170,7 +182,7 @@ def run_tool(name, args):
   return out or "(no output)"
 
 
-def execute_tool(name, args):
+def execute_tool(name: str, args: Json) -> tuple[str, str, bool]:
   """Run one tool; returns (output for the model, display body, failed)."""
   try:
     # Dict patterns match on "at least these keys", so extra fields a model
@@ -211,7 +223,7 @@ def execute_tool(name, args):
     return f"error: {e}", red(f"error: {e}"), True
 
 
-def sse_post(url, headers, body):
+def sse_post(url: str, headers: dict[str, str], body: Json) -> Iterator[Json]:
   """POST `body` and yield each JSON payload of the SSE response as it arrives."""
   req = urllib.request.Request(
       url, data=json.dumps(body).encode(),
@@ -235,22 +247,30 @@ def sse_post(url, headers, body):
 
 # Each provider keeps the conversation in its own wire format in
 # self.messages, prints response text as it streams in, and returns the list
-# of tool calls to run, each normalized to {id, name, args}.
+# of tool calls to run, each normalized to a ToolCall.
 
 class Provider:
-  def __init__(self, key):
+  model: str
+
+  def __init__(self, key: str) -> None:
     self.key = key
-    self.messages = []
+    self.messages: list[Json] = []
+
+  def send_user(self, text: str) -> list[ToolCall]:
+    raise NotImplementedError
+
+  def send_results(self, results: list[tuple[ToolCall, str]]) -> list[ToolCall]:
+    raise NotImplementedError
 
 
 class Anthropic(Provider):
   model = "claude-opus-4-8"
 
-  def send_user(self, text):
+  def send_user(self, text: str) -> list[ToolCall]:
     self.messages.append({"role": "user", "content": text})
     return self._request()
 
-  def send_results(self, results):
+  def send_results(self, results: list[tuple[ToolCall, str]]) -> list[ToolCall]:
     self.messages.append({
         "role": "user",
         "content": [
@@ -260,7 +280,7 @@ class Anthropic(Provider):
     })
     return self._request()
 
-  def _request(self):
+  def _request(self) -> list[ToolCall]:
     spin()
     events = sse_post(
         "https://api.anthropic.com/v1/messages",
@@ -280,7 +300,7 @@ class Anthropic(Provider):
     )
     # Tool arguments stream as JSON fragments; collect them in "input" as a
     # string, then parse once the stream ends.
-    blocks = []
+    blocks: list[Json] = []
     for ev in events:
       if ev["type"] == "content_block_start":
         block = ev["content_block"]
@@ -312,17 +332,17 @@ class Anthropic(Provider):
 class OpenAI(Provider):
   model = "gpt-5.1"
 
-  def send_user(self, text):
+  def send_user(self, text: str) -> list[ToolCall]:
     self.messages.append({"role": "user", "content": text})
     return self._request()
 
-  def send_results(self, results):
+  def send_results(self, results: list[tuple[ToolCall, str]]) -> list[ToolCall]:
     for call, out in results:
       self.messages.append(
           {"role": "tool", "tool_call_id": call["id"], "content": out})
     return self._request()
 
-  def _request(self):
+  def _request(self) -> list[ToolCall]:
     spin()
     events = sse_post(
         "https://api.openai.com/v1/chat/completions",
@@ -336,7 +356,8 @@ class OpenAI(Provider):
     )
     # Tool calls stream as fragments addressed by "index"; ids and names
     # arrive on the first fragment, argument JSON dribbles in across the rest.
-    text, tool_calls = "", []
+    text = ""
+    tool_calls: list[Json] = []
     for ev in events:
       if not ev.get("choices"):
         continue
@@ -354,7 +375,7 @@ class OpenAI(Provider):
         slot["function"]["name"] += func.get("name") or ""
         slot["function"]["arguments"] += func.get("arguments") or ""
     newline()
-    msg = {"role": "assistant", "content": text or None}
+    msg: Json = {"role": "assistant", "content": text or None}
     if tool_calls:
       msg["tool_calls"] = tool_calls
     self.messages.append(msg)
@@ -366,11 +387,11 @@ class OpenAI(Provider):
 class Google(Provider):
   model = "gemini-flash-latest"
 
-  def send_user(self, text):
+  def send_user(self, text: str) -> list[ToolCall]:
     self.messages.append({"role": "user", "parts": [{"text": text}]})
     return self._request()
 
-  def send_results(self, results):
+  def send_results(self, results: list[tuple[ToolCall, str]]) -> list[ToolCall]:
     self.messages.append({
         "role": "user",
         "parts": [
@@ -381,7 +402,7 @@ class Google(Provider):
     })
     return self._request()
 
-  def _request(self):
+  def _request(self) -> list[ToolCall]:
     spin()
     events = sse_post(
         f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}"
@@ -401,7 +422,7 @@ class Google(Provider):
     )
     # Merge adjacent plain-text fragments; keep every other part verbatim
     # (functionCall, thoughtSignature, ...) so the history replays cleanly.
-    parts = []
+    parts: list[Json] = []
     for ev in events:
       candidates = ev.get("candidates")
       if not candidates:
@@ -420,7 +441,7 @@ class Google(Provider):
             for p in parts if "functionCall" in p]
 
 
-def pick_provider():
+def pick_provider() -> Provider:
   if os.environ.get("ANTHROPIC_API_KEY"):
     return Anthropic(os.environ["ANTHROPIC_API_KEY"])
   if os.environ.get("OPENAI_API_KEY"):
@@ -431,7 +452,7 @@ def pick_provider():
       "casper: set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY / GOOGLE_API_KEY")
 
 
-def main():
+def main() -> None:
   # When piped from curl, stdin is the script itself — reattach it to the
   # terminal so the prompt works.
   if not sys.stdin.isatty():

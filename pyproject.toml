@@ -3,6 +3,9 @@ name = "casper"
 version = "0.0.1"
 requires-python = ">=3.12"
 
+[tool.mypy]
+strict = true
+
 [tool.pylint.format]
 indent-string = '  '
 indent-after-paren = 2
