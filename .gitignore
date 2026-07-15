@@ -3,6 +3,12 @@ __pycache__/
 *.pyc
 .venv/
 
+# Secrets
+.env
+
+# Editors
+*.swp
+
 # OS
 .DS_Store
 

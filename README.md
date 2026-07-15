@@ -1,4 +1,4 @@
-# Casper
+# Casper 👻
 
 A coding agent you can run without installing anything.
 
