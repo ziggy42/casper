@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import atexit
 import itertools
 import json
 import os
@@ -68,6 +69,29 @@ def display_path(path: Path) -> str:
   except ValueError:
     return str(path)
   return "~" if str(rel) == "." else f"~/{rel}"
+
+
+def terminal_title_text(title: str) -> str:
+  # Keep control characters out of OSC strings.
+  return "".join(c for c in title if c not in "\x07\x1b\x9c\r\n")
+
+
+def write_terminal_control(sequence: str) -> None:
+  if sys.stdout.isatty():
+    sys.stdout.write(sequence)
+    sys.stdout.flush()
+
+
+def push_terminal_title() -> None:
+  write_terminal_control("\x1b]22;0\x07")
+
+
+def pop_terminal_title() -> None:
+  write_terminal_control("\x1b]23;0\x07")
+
+
+def set_terminal_title(title: str) -> None:
+  write_terminal_control(f"\x1b]2;{terminal_title_text(title)}\x07")
 
 
 class _Term:  # pylint: disable=too-few-public-methods
@@ -558,7 +582,12 @@ def main() -> None:
     pass
 
   provider = pick_provider()
-  hints = dim(f"{provider.model} · {display_path(Path.cwd())}")
+  cwd = display_path(Path.cwd())
+  if sys.stdout.isatty():
+    push_terminal_title()
+    atexit.register(pop_terminal_title)
+    set_terminal_title(f"casper · {cwd}")
+  hints = dim(f"{provider.model} · {cwd}")
   banner = f"👻 {bold('casper')}  {hints}"
   print(banner)
 
