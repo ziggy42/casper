@@ -62,6 +62,14 @@ def plural(n: int, noun: str) -> str:
   return f"{n} {noun}" + ("" if n == 1 else "s")
 
 
+def display_path(path: Path) -> str:
+  try:
+    rel = path.resolve().relative_to(Path.home().resolve())
+  except ValueError:
+    return str(path)
+  return "~" if str(rel) == "." else f"~/{rel}"
+
+
 class _Term:  # pylint: disable=too-few-public-methods
   """Mutable display state; the module is in effect one terminal object."""
   midline: ClassVar[bool] = False
@@ -550,7 +558,7 @@ def main() -> None:
     pass
 
   provider = pick_provider()
-  hints = dim(f"{provider.model} · /clear to reset · ctrl-d to exit")
+  hints = dim(f"{provider.model} · {display_path(Path.cwd())}")
   banner = f"👻 {bold('casper')}  {hints}"
   print(banner)
 

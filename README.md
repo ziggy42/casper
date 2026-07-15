@@ -7,6 +7,12 @@ curl -fsSL https://raw.githubusercontent.com/ziggy42/casper/main/casper.py \
     | ANTHROPIC_API_KEY=sk-... python3
 ```
 
+## Commands
+
+- `/clear` resets the conversation and clears the screen.
+- Ctrl-C cancels the current turn.
+- Ctrl-D exits.
+
 ## Picking a model
 
 Casper runs on whatever you have. It selects the provider from whichever API
