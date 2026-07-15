@@ -265,7 +265,7 @@ def run_tool(name: str, args: Json) -> str:
   the tool runs, rewritten with a green/red dot once it finishes, then the
   result body indented beneath it."""
   title = bold(tool_title(name, args))
-  emit(f" {dim('●')} {title}")
+  emit(f"\n {dim('●')} {title}")
   out, body, failed = execute_tool(name, args)
   emit(f"\r {red('●') if failed else green('●')} {title}\n")
   lines = body.rstrip("\n").split("\n") if body else [dim("(no output)")]
