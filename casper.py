@@ -298,7 +298,12 @@ def run_tool(name: str, args: Json) -> str:
   the tool runs, rewritten with a green/red dot once it finishes, then the
   result body indented beneath it."""
   title = bold(tool_title(name, args))
-  emit(f"\n {dim('●')} {title}")
+  # A tool may follow streamed prose, a just-erased spinner, or another tool.
+  # Close prose if necessary, but do not invent a blank line: completed tool
+  # output already ends on a clean line, and the spinner occupies no line once
+  # erased. This keeps every transition compact and deterministic.
+  newline()
+  emit(f" {dim('●')} {title}")
   out, body, failed = execute_tool(name, args)
   emit(f"\r {red('●') if failed else green('●')} {title}\n")
   lines = body.rstrip("\n").split("\n") if body else [dim("(no output)")]
