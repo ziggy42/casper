@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import atexit
+import getpass
 import itertools
 import json
 import os
@@ -551,18 +552,50 @@ class Google(Provider):
 
 # ── Entry ────────────────────────────────────────────────────────────────
 
+PROVIDERS: tuple[tuple[str, str, type[Provider]], ...] = (
+    ("Anthropic", "ANTHROPIC_API_KEY", Anthropic),
+    ("OpenAI", "OPENAI_API_KEY", OpenAI),
+    ("Gemini", "GEMINI_API_KEY", Google),
+)
+
+
+def prompt_for_key() -> tuple[type[Provider], str]:
+  """Ask which provider to use and read its key, masked, from the terminal.
+
+  Raises ValueError/EOFError/KeyboardInterrupt on any bad or abandoned input;
+  callers decide how to report that.
+  """
+  print("No API key set. Pick a provider:")
+  for num, (name, _, _) in enumerate(PROVIDERS, start=1):
+    print(f"  {num}) {name}")
+  choice = int(input("> ").strip()) - 1
+  if choice not in range(len(PROVIDERS)):
+    raise ValueError("invalid provider choice")
+  name, _, cls = PROVIDERS[choice]
+  # Masked, and read via getpass rather than input(), so the key is not
+  # echoed or passed on the command line.
+  key = getpass.getpass(f"{name} API key: ")
+  if not key:
+    raise ValueError("no key entered")
+  return cls, key
+
+
 def pick_provider() -> Provider:
   """Build the provider for whichever API key is set, CASPER_MODEL applied."""
   provider: Provider
-  if os.environ.get("ANTHROPIC_API_KEY"):
-    provider = Anthropic(os.environ["ANTHROPIC_API_KEY"])
-  elif os.environ.get("OPENAI_API_KEY"):
-    provider = OpenAI(os.environ["OPENAI_API_KEY"])
-  elif os.environ.get("GEMINI_API_KEY"):
-    provider = Google(os.environ["GEMINI_API_KEY"])
+  for _, env_var, cls in PROVIDERS:
+    if key := os.environ.get(env_var):
+      provider = cls(key)
+      break
   else:
-    sys.exit("casper: set ANTHROPIC_API_KEY, OPENAI_API_KEY, "
-             "or GEMINI_API_KEY")
+    if not sys.stdin.isatty():
+      sys.exit("casper: set ANTHROPIC_API_KEY, OPENAI_API_KEY, "
+               "or GEMINI_API_KEY")
+    try:
+      cls, key = prompt_for_key()
+    except (KeyboardInterrupt, EOFError, ValueError):
+      sys.exit("\ncasper: no API key provided")
+    provider = cls(key)
   provider.model = os.environ.get("CASPER_MODEL", provider.model)
   return provider
 
