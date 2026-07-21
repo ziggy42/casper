@@ -141,6 +141,12 @@ def newline() -> None:
   _Term.midline = False
 
 
+def begin_response() -> None:
+  """Visually separate a user prompt from Casper's next response."""
+  newline()
+  print()
+
+
 # ── Tools ────────────────────────────────────────────────────────────────
 # The schema and the implementations live together: a tool's "required"
 # parameters must stay in step with what execute_tool destructures. The
@@ -374,6 +380,7 @@ class Anthropic(Provider):
   model = "claude-opus-4-8"
 
   def send_user(self, text: str) -> list[ToolCall]:
+    begin_response()
     self.messages.append({"role": "user", "content": text})
     return self._request()
 
@@ -441,6 +448,7 @@ class OpenAI(Provider):
   model = "gpt-5.6"
 
   def send_user(self, text: str) -> list[ToolCall]:
+    begin_response()
     self.messages.append({"role": "user", "content": text})
     return self._request()
 
@@ -500,6 +508,7 @@ class Google(Provider):
   model = "gemini-3-flash-preview"
 
   def send_user(self, text: str) -> list[ToolCall]:
+    begin_response()
     self.messages.append({"role": "user", "parts": [{"text": text}]})
     return self._request()
 
